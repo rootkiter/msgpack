@@ -17,21 +17,35 @@ type writer interface {
 
 type byteWriter struct {
 	io.Writer
+
+	buf       []byte
+	bootstrap [64]byte
 }
 
-func (w byteWriter) WriteByte(b byte) error {
-	_, err := w.Write([]byte{b})
+func newByteWriter(w io.Writer) *byteWriter {
+	bw := &byteWriter{
+		Writer: w,
+	}
+	bw.buf = bw.bootstrap[:]
+	return bw
+}
+
+func (w *byteWriter) WriteByte(c byte) error {
+	w.buf = w.buf[:1]
+	w.buf[0] = c
+	_, err := w.Write(w.buf)
 	return err
 }
 
-func (w byteWriter) WriteString(s string) (int, error) {
-	return w.Write([]byte(s))
+func (w *byteWriter) WriteString(s string) (int, error) {
+	w.buf = append(w.buf[:0], s...)
+	return w.Write(w.buf)
 }
 
 // Marshal returns the MessagePack encoding of v.
-func Marshal(v ...interface{}) ([]byte, error) {
+func Marshal(v interface{}) ([]byte, error) {
 	var buf bytes.Buffer
-	err := NewEncoder(&buf).Encode(v...)
+	err := NewEncoder(&buf).Encode(v)
 	return buf.Bytes(), err
 }
 
@@ -41,13 +55,15 @@ type Encoder struct {
 
 	sortMapKeys   bool
 	structAsArray bool
+	useJSONTag    bool
+	useCompact    bool
 }
 
 // NewEncoder returns a new encoder that writes to w.
 func NewEncoder(w io.Writer) *Encoder {
 	bw, ok := w.(writer)
 	if !ok {
-		bw = byteWriter{Writer: w}
+		bw = newByteWriter(w)
 	}
 	return &Encoder{
 		w:   bw,
@@ -59,27 +75,32 @@ func NewEncoder(w io.Writer) *Encoder {
 // Supported map types are:
 //   - map[string]string
 //   - map[string]interface{}
-func (e *Encoder) SortMapKeys(v bool) *Encoder {
-	e.sortMapKeys = v
+func (e *Encoder) SortMapKeys(flag bool) *Encoder {
+	e.sortMapKeys = flag
 	return e
 }
 
 // StructAsArray causes the Encoder to encode Go structs as MessagePack arrays.
-func (e *Encoder) StructAsArray(v bool) *Encoder {
-	e.structAsArray = v
+func (e *Encoder) StructAsArray(flag bool) *Encoder {
+	e.structAsArray = flag
 	return e
 }
 
-func (e *Encoder) Encode(v ...interface{}) error {
-	for _, vv := range v {
-		if err := e.encode(vv); err != nil {
-			return err
-		}
-	}
-	return nil
+// UseJSONTag causes the Encoder to use json struct tag as fallback option
+// if there is no msgpack tag.
+func (e *Encoder) UseJSONTag(flag bool) *Encoder {
+	e.useJSONTag = flag
+	return e
 }
 
-func (e *Encoder) encode(v interface{}) error {
+// UseCompactEncoding causes the Encoder to chose the most compact encoding.
+// For example, it allows to encode Go int64 as msgpack int8 saving 7 bytes.
+func (e *Encoder) UseCompactEncoding(flag bool) *Encoder {
+	e.useCompact = flag
+	return e
+}
+
+func (e *Encoder) Encode(v interface{}) error {
 	switch v := v.(type) {
 	case nil:
 		return e.EncodeNil()
@@ -88,13 +109,13 @@ func (e *Encoder) encode(v interface{}) error {
 	case []byte:
 		return e.EncodeBytes(v)
 	case int:
-		return e.EncodeInt(int64(v))
+		return e.encodeInt64Cond(int64(v))
 	case int64:
-		return e.EncodeInt(v)
+		return e.encodeInt64Cond(v)
 	case uint:
-		return e.EncodeUint(uint64(v))
+		return e.encodeUint64Cond(uint64(v))
 	case uint64:
-		return e.EncodeUint(v)
+		return e.encodeUint64Cond(v)
 	case bool:
 		return e.EncodeBool(v)
 	case float32:
@@ -102,16 +123,25 @@ func (e *Encoder) encode(v interface{}) error {
 	case float64:
 		return e.EncodeFloat64(v)
 	case time.Duration:
-		return e.EncodeInt(int64(v))
+		return e.encodeInt64Cond(int64(v))
 	case time.Time:
 		return e.EncodeTime(v)
 	}
 	return e.EncodeValue(reflect.ValueOf(v))
 }
 
+func (e *Encoder) EncodeMulti(v ...interface{}) error {
+	for _, vv := range v {
+		if err := e.Encode(vv); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (e *Encoder) EncodeValue(v reflect.Value) error {
-	encode := getEncoder(v.Type())
-	return encode(e, v)
+	fn := getEncoder(v.Type())
+	return fn(e, v)
 }
 
 func (e *Encoder) EncodeNil() error {
